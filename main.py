@@ -1,228 +1,216 @@
-# RP2350 4IO JSON controller + W5500 TCP SERVER
-# Final version – heartbeat Type:0, event Type:1
+# ===============================================================
+#   RP2350 4IO + W5500 TCP CONTROLLER
+#   AUTOSTART – NO COMMANDS NEEDED
+#   Allowed IP: 192.168.10.99
+# ===============================================================
 
+import _thread
+import time, json, utime
 from machine import Pin, SPI, WDT
-import utime, sys
-import w5500    # your fixed w5500.py
+import w5500
 
-# -------------------- NETWORK CONFIG --------------------
-IP      = (192,168,10,140)
-SUBNET  = (255,255,255,0)
-GATEWAY = (192,168,10,1)
-MAC     = (0xDE,0xAD,0xBE,0xEF,0x00,0x01)
-TCP_PORT = 5005
+# ===============================================================
+# CONFIG
+# ===============================================================
+ALLOWED_IP = (192, 168, 10, 99)
 
-HB_INTERVAL_MS = 10000
-MAIN_LOOP_SLEEP_MS = 2
-DEBOUNCE_MS = 30
+MY_IP      = (192, 168, 10, 140)
+SUBNET     = (255, 255, 255, 0)
+GATEWAY    = (192, 168, 10, 1)
+MAC        = (0xDE,0xAD,0xBE,0xEF,0x00,0x01)
+
+PORT = 5005
+HEARTBEAT_MS = 10000
+MAIN_SLEEP_MS = 2
 MAX_PULSE_MS = 5000
-WDT_TIMEOUT_MS = 2000
 
-# -------------------- I/O CONFIG -------------------------
-OUTPUT_PINS = [2,3,5,6]
-INPUT_PINS  = [29,28,27,26]
+OUTPUT_PINS = [2, 3, 5, 6]
+INPUT_PINS  = [29, 28, 27, 26]
 
-# -------------------- INIT HARDWARE ----------------------
+# ===============================================================
+# HARDWARE INIT
+# ===============================================================
 outs = [Pin(p, Pin.OUT, value=0) for p in OUTPUT_PINS]
-out_state = [0,0,0,0]
-auto_off_deadline = [0,0,0,0]
+out_state = [0, 0, 0, 0]
+auto_off_deadline = [0, 0, 0, 0]
 
 ins = [Pin(p, Pin.IN, Pin.PULL_UP) for p in INPUT_PINS]
-in_raw = [ins[i].value() for i in range(4)]
-in_stable = in_raw[:]
-in_last_change = [utime.ticks_ms()] * 4
+in_stable = [ins[i].value() for i in range(4)]
+in_last_raw = in_stable[:]
 
-# -------------------- WATCHDOG --------------------------
-wdt = WDT(timeout=WDT_TIMEOUT_MS)
+wdt = WDT(timeout=2500)
 
-# -------------------- W5500 INIT ------------------------
-print("Initializing W5500...")
-
-# HW reset
-rst = Pin(14, Pin.OUT)
-rst.value(0)
-utime.sleep_ms(200)
-rst.value(1)
-utime.sleep_ms(200)
-
-# SPI init
-spi = SPI(1,
-          baudrate=6_000_000,
-          polarity=0,
-          phase=0,
-          sck=Pin(10),
-          mosi=Pin(11),
-          miso=Pin(12))
-
-w = w5500.W5500(spi, Pin(13), Pin(14))
-w.set_ip(IP, SUBNET, GATEWAY, MAC)
-
-print("Ethernet ready:", IP)
-
-# -------------------- TCP SERVER ------------------------
-def open_socket():
-    w.socket0_close()
-    utime.sleep_ms(10)
-    w.socket0_open(TCP_PORT)
-    utime.sleep_ms(10)
-    w.socket0_listen()
-    print("Listening on port", TCP_PORT)
-
-open_socket()
-print("READY. Waiting for client...")
-
-# --------------------- JSON HELPERS ----------------------
+# ===============================================================
+# JSON HELPERS
+# ===============================================================
 telemetry_id = 1
 
-def j01(x): return "1" if x else "0"
-
-def telemetry_json(event_type):   # event_type: 0=heartbeat, 1=event
+def telemetry_json(type_id):
     global telemetry_id
-    s = (
-        '{"MessageID":' + str(telemetry_id) +
-        ',"Type":' + str(event_type) +
-        ',"R1":' + j01(out_state[0]) +
-        ',"R2":' + j01(out_state[1]) +
-        ',"R3":' + j01(out_state[2]) +
-        ',"R4":' + j01(out_state[3]) +
-        ',"T1":' + j01(in_stable[0]) +
-        ',"T2":' + j01(in_stable[1]) +
-        ',"T3":' + j01(in_stable[2]) +
-        ',"T4":' + j01(in_stable[3]) +
-        '}\n'
-    )
-    telemetry_id = (telemetry_id % 2147483647) + 1
-    return s
+    s = {
+        "Type": type_id,
+        "MessageID": telemetry_id,
+        "R1": out_state[0],
+        "R2": out_state[1],
+        "R3": out_state[2],
+        "R4": out_state[3],
+        "T1": in_stable[0],
+        "T2": in_stable[1],
+        "T3": in_stable[2],
+        "T4": in_stable[3]
+    }
+    telemetry_id = (telemetry_id + 1) & 0x7FFFFFFF
+    return (json.dumps(s) + "\n").encode()
 
-def send_tcp(msg):
-    try:
-        w.socket0_send(msg.encode())
-    except:
-        pass
+def ack_json(cmd, status):
+    s = {
+        "MessageID": cmd["MessageID"],
+        "Type": cmd["Type"],
+        "Mode": cmd["Mode"],
+        "SignalLenght": cmd["SignalLenght"],
+        "R1": cmd["R1"],
+        "R2": cmd["R2"],
+        "R3": cmd["R3"],
+        "R4": cmd["R4"],
+        "Status": status
+    }
+    return (json.dumps(s) + "\n").encode()
 
-# --------------------- OUTPUT CONTROL --------------------
-def validate_pin_index(i):
-    return 0 <= i < 4
+# ===============================================================
+# OUTPUT LOGIC
+# ===============================================================
+def set_output(i, v, send_event=True):
+    out_state[i] = 1 if v else 0
+    outs[i].value(out_state[i])
+    if send_event:
+        server_send(telemetry_json(1))
 
-def out_perm_on(i):
-    return out_state[i] == 1 and auto_off_deadline[i] == 0
-
-def set_output(i, v, *, from_auto=False):
-    if not validate_pin_index(i): return False
-    v = 1 if v else 0
-    changed = (out_state[i] != v)
-    outs[i].value(v)
-    out_state[i] = v
-    if changed or from_auto:
-        send_tcp(telemetry_json(1))  # event type=1
-    return changed
-
-def arm_auto_off(i, ms):
-    if ms > MAX_PULSE_MS: ms = MAX_PULSE_MS
-    auto_off_deadline[i] = utime.ticks_add(utime.ticks_ms(), ms)
-
-def clear_auto_off(i):
-    auto_off_deadline[i] = 0
-
-def check_auto_offs(now):
+def process_auto_off(now):
     for i in range(4):
         d = auto_off_deadline[i]
         if d and utime.ticks_diff(now, d) >= 0:
-            clear_auto_off(i)
-            set_output(i, 0, from_auto=True)
+            auto_off_deadline[i] = 0
+            set_output(i, 0, send_event=True)
 
-# --------------------- INPUT DEBOUNCE --------------------
-def scan_inputs(now):
-    global in_raw, in_stable, in_last_change
-    raw_now = [ins[i].value() for i in range(4)]
+# ===============================================================
+# INPUT LOGIC
+# ===============================================================
+def process_inputs(now):
+    global in_last_raw, in_stable
+    change = False
+
     for i in range(4):
-        if raw_now[i] != in_raw[i]:
-            in_raw[i] = raw_now[i]
-            in_last_change[i] = now
+        raw = ins[i].value()
+        if raw != in_last_raw[i]:
+            in_last_raw[i] = raw
         else:
-            if raw_now[i] != in_stable[i] and utime.ticks_diff(now, in_last_change[i]) >= DEBOUNCE_MS:
-                in_stable[i] = raw_now[i]
-                send_tcp(telemetry_json(1))  # input event
+            if raw != in_stable[i]:
+                in_stable[i] = raw
+                change = True
 
-# --------------------- COMMAND PARSER --------------------
-def parse_cmd(s):
+    if change:
+        server_send(telemetry_json(1))
+
+# ===============================================================
+# COMMAND PARSER
+# ===============================================================
+def parse_cmd(line):
     try:
-        d = eval(s)   # safe because your PC always sends valid JSON dict
-        return d
+        return json.loads(line)
     except:
         return None
 
 def handle_cmd(cmd):
-    try:
-        Mode  = int(cmd.get("Mode",1))
-        Type  = int(cmd.get("Type",1))
-        Sig   = int(cmd.get("SignalLenght",1000))
+    ok = 1
 
-        targets = [
-            int(cmd.get("R1",0)),
-            int(cmd.get("R2",0)),
-            int(cmd.get("R3",0)),
-            int(cmd.get("R4",0))
-        ]
-
-        for i,t in enumerate(targets):
-            if t != 1: continue
-
-            if Mode == 1:
-                clear_auto_off(i)
-                set_output(i, 1 if Type==1 else 0)
+    for i in range(4):
+        if cmd[f"R{i+1}"] == 1:
+            if cmd["Mode"] == 1:   # permanent
+                auto_off_deadline[i] = 0
+                set_output(i, 1)
             else:
-                if Type == 1:
-                    set_output(i,1)
-                    arm_auto_off(i,Sig)
-                else:
-                    clear_auto_off(i)
-                    set_output(i,0)
+                # pulse
+                set_output(i, 1)
+                ms = cmd["SignalLenght"]
+                if ms > MAX_PULSE_MS: ms = MAX_PULSE_MS
+                if ms <= 0: ms = 1000
+                auto_off_deadline[i] = utime.ticks_add(utime.ticks_ms(), ms)
+        else:
+            auto_off_deadline[i] = 0
+            set_output(i, 0)
 
-    except:
-        pass
+    server_send(ack_json(cmd, ok))
 
-# --------------------- MAIN LOOP ------------------------
-buf = ""
-last_hb = utime.ticks_ms()
+# ===============================================================
+# W5500 SETUP
+# ===============================================================
+SCK=10; MOSI=11; MISO=12; CS=13; RESET=14
 
-while True:
-    now = utime.ticks_ms()
+spi = SPI(1, baudrate=6_000_000, polarity=0, phase=0,
+          sck=Pin(SCK), mosi=Pin(MOSI), miso=Pin(MISO))
 
-    # watchdog
-    try: wdt.feed()
-    except: pass
+w = w5500.W5500(spi, Pin(CS), Pin(RESET))
+w.set_ip(MY_IP, SUBNET, GATEWAY, MAC)
 
-    # TCP status monitor
-    st = w.socket0_status()
+# ===============================================================
+# SERVER (THREAD)
+# ===============================================================
+client_connected = False
 
-    # ---- ESTABLISHED ----
-    if st == 0x17:
-        # Heartbeat
-        if utime.ticks_diff(now, last_hb) >= HB_INTERVAL_MS:
-            send_tcp(telemetry_json(0))  # HB Type=0
-            last_hb = now
+def server_send(data):
+    global client_connected
+    if client_connected:
+        try:
+            w.socket0_send(data)
+        except:
+            client_connected = False
 
-        # Incoming data
-        data = w.socket0_recv()
-        if data:
-            try:
-                s = data.decode().strip()
-                buf += s
-                if "\n" in buf or "}" in buf:
-                    cmd = parse_cmd(buf)
-                    if cmd: handle_cmd(cmd)
-                    buf = ""
-            except:
-                buf = ""
+def server_thread():
+    global client_connected
 
-    # ---- CLOSED → reopen ----
-    elif st == 0x00:
-        open_socket()
+    w.socket0_open(PORT)
+    w.socket0_listen()
 
-    # housekeeping
-    check_auto_offs(now)
-    scan_inputs(now)
+    last_hb = utime.ticks_ms()
 
-    utime.sleep_ms(MAIN_LOOP_SLEEP_MS)
+    while True:
+        now = utime.ticks_ms()
+        wdt.feed()
 
+        status = w.socket0_status()
+
+        if status == 0x17:   # ESTABLISHED
+            if not client_connected:
+                client_connected = True
+
+            # Heartbeat
+            if utime.ticks_diff(now, last_hb) >= HEARTBEAT_MS:
+                server_send(telemetry_json(0))
+                last_hb = now
+
+            # RECEIVE
+            data = w.socket0_recv()
+            if data:
+                try:
+                    line = data.decode().strip()
+                    cmd = parse_cmd(line)
+                    if cmd:
+                        handle_cmd(cmd)
+                except:
+                    pass
+
+        else:
+            client_connected = False
+            w.socket0_open(PORT)
+            w.socket0_listen()
+
+        process_auto_off(now)
+        process_inputs(now)
+
+        utime.sleep_ms(MAIN_SLEEP_MS)
+
+# ===============================================================
+# AUTO-START SERVER
+# ===============================================================
+_thread.start_new_thread(server_thread, ())
+print("SERVER STARTED on port", PORT)
